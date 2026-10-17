@@ -282,15 +282,34 @@ jobs:
           echo "=== 关键 config ==="
           grep -E '^CONFIG_(LTO|CFI|LD_IS|NFC|I2C)' out/.config || true
 
-      - name: Verify nfc_i2c.o built
+      - name: Verify nfc driver built
         if: success() && inputs.nfc_enable
         working-directory: kernel
         run: |
           set -euo pipefail
-          OBJ=$(find out -name 'nfc_i2c.o' -print -quit)
-          [ -n "$OBJ" ] || { echo "::error::nfc_i2c.o 未产出"; exit 1; }
-          echo "OK: $OBJ"
-          llvm-nm "$OBJ" | grep -iE 'nfc_i2c_dev_probe' || true
+          # 注意：CONFIG_NFC_QTI_I2C=y 时 kbuild 只产出 built-in.a，不会生成 nfc_i2c.o
+          # （nfc_i2c.o 仅在使用 =m 构建模块时出现）。因此按 .o 中间产物 + vmlinux 符号双重复核。
+          echo "=== 1) 驱动目标文件 ==="
+          for f in drivers/nfc/qti/nfc_common.o drivers/nfc/qti/nfc_i2c_drv.o; do
+            O=$(find out -path "*${f}" -print -quit)
+            if [ -n "$O" ]; then echo "  OK   $f"; else echo "  MISS $f"; fi
+          done
+
+          echo "=== 2) built-in.a 归档 ==="
+          A=$(find out -path '*drivers/nfc/qti/built-in.a' -print -quit)
+          [ -n "$A" ] && echo "  OK   $A" || echo "  MISS qti/built-in.a"
+
+          echo "=== 3) vmlinux 中是否含 NFC 符号（决定性判据）==="
+          if llvm-nm out/vmlinux | grep -qE 'nfc_i2c_dev_probe|nfc_parse_dt'; then
+            llvm-nm out/vmlinux | grep -E 'nfc_i2c_dev_probe|nfc_parse_dt' | head -n 10
+            echo "NFC_SYMBOLS_PRESENT=yes" >> "$GITHUB_ENV"
+          else
+            echo "::error::vmlinux 中未找到 NFC 符号，驱动未真正链接进内核"
+            exit 1
+          fi
+
+          echo "=== 4) 内核镜像 ==="
+          ls -lh out/arch/arm64/boot/Image
 
       - name: Gather artifacts
         if: success()
@@ -339,6 +358,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: config-${{ github.run_number }}
-          path: kernel/out/.config
+          # 注意路径前缀必须是 kernel/（工作目录是仓库根，非 kernel/）
+          path: |
+            kernel/out/.config
+            kernel/.config
           if-no-files-found: warn
           retention-days: 7
