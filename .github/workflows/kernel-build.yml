@@ -48,8 +48,11 @@ concurrency:
 env:
   UPSTREAM_REPO: HeliumStudio-Dev/kernel_xiaomi_raphael-5.4
   ARCH: arm64
-  # 实测自 arch/arm64/configs/vendor/ —— 不是 raphael_defconfig
-  DEFCONFIG: vendor/sm8150-qgki_defconfig
+  # 设备专用 defconfig（位于 configs/ 根目录，不是 vendor/ 下）。
+  # 关键：含 CONFIG_MACH_XIAOMI_RAPHAEL=y —— 这是 arch/arm64/boot/dts/qcom/Makefile
+  # 中 dtbo-$(CONFIG_MACH_XIAOMI_RAPHAEL) 的前提，缺它则 dtbo 根本不构建。
+  # 另含指纹/触摸/AKM09970/DRV8846 等设备驱动，且不走 LTO。
+  DEFCONFIG: raphael_defconfig
 
 jobs:
   build:
@@ -272,6 +275,22 @@ jobs:
           set -euo pipefail
           make -C "$PWD" O=out ARCH=${ARCH} LLVM=1 LLVM_IAS=1 -j"$(nproc)"
 
+      # 面板时序 sm8150-sde-display.dtsi 经 raphael-sm8150.dtsi 被
+      # raphael-sm8150-overlay.dts(/plugin/) include，最终进 dtbo.img。
+      # 默认 make 只出 Image，必须显式构建 dtbs。
+      - name: Build device trees / dtbo
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          echo "=== 构建 dtbs（含 .dtbo）==="
+          make -C "$PWD" O=out ARCH=${ARCH} LLVM=1 LLVM_IAS=1 -j"$(nproc)" dtbs || {
+            echo "::warning::dtbs 目标失败，继续检查已产出文件"
+          }
+          echo "=== 产出的 dts 目标 ==="
+          find out/arch/arm64/boot/dts -name '*.dtb' -o -name '*.dtbo' 2>/dev/null | sort || true
+          echo "=== dtbo.img（若存在）==="
+          ls -lh out/arch/arm64/boot/dtbo.img 2>/dev/null || echo "  (无 dtbo.img，需按厂商规则打包)"
+
       - name: Collect diagnostics on failure
         if: failure()
         working-directory: kernel
@@ -329,11 +348,20 @@ jobs:
           echo "=== 4) 内核镜像 ==="
           ls -lh out/arch/arm64/boot/Image
 
+          echo "=== 5) dtbo / 设备树产物 ==="
+          find out/arch/arm64/boot/dts -name '*.dtb' -o -name '*.dtbo' 2>/dev/null | sort || true
+          # 确认面板时序文件确实参与了构建
+          if find out/arch/arm64/boot/dts -name '*raphael*' 2>/dev/null | grep -q .; then
+            echo "  OK   raphael 设备树已构建"
+          else
+            echo "  WARN 未见 raphael 设备树产物（检查 CONFIG_MACH_XIAOMI_RAPHAEL）"
+          fi
+
           if [ "$FAIL" -ne 0 ]; then
             echo "::error::NFC 驱动确实未编译（目标文件/归档/.config 缺失）"
             exit 1
           fi
-          echo "::notice::NFC 驱动已编译并归档（LTO 下不依赖 vmlinux 符号名）"
+          echo "::notice::NFC 驱动已编译并归档"
 
       - name: Gather artifacts
         if: success()
@@ -356,6 +384,8 @@ jobs:
             kernel/out/arch/arm64/boot/Image
             kernel/out/arch/arm64/boot/Image.gz
             kernel/out/arch/arm64/boot/dtbo.img
+            kernel/out/arch/arm64/boot/dts/qcom/*.dtbo
+            kernel/out/arch/arm64/boot/dts/qcom/*.dtb
             kernel/out/.config
           if-no-files-found: warn
           retention-days: 14
