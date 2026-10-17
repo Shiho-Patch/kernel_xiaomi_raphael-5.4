@@ -297,7 +297,7 @@
 &sde_dp {
 	qcom,dp-usbpd-detection = <&pm8150b_pdphy>;
 	qcom,ext-disp = <&ext_disp>;
-	qcom,dp-aux-switch = <&fsa4480>;
+	// qcom,dp-aux-switch = <&fsa4480>;
 
 	qcom,usbplug-cc-gpio = <&tlmm 38 0>;
 
@@ -307,8 +307,7 @@
 };
 
 &mdss_mdp {
-	/* TODO: Fix sde_dp */
-	connectors = <&smmu_sde_unsec &smmu_sde_sec &sde_rscc &sde_wb &sde_dsi
+	connectors = <&smmu_sde_unsec &smmu_sde_sec &sde_rscc &sde_wb &sde_dp &sde_dsi
 		&sde_dsi1>;
 };
 

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2018-2020 The Linux Foundation. All rights reserved.
+ * Copyright (C) 2021 XiaoMi, Inc.
  */
 
 #define pr_fmt(fmt)	"ALG: %s: " fmt, __func__
@@ -273,28 +274,28 @@ int get_cycle_counts(struct cycle_counter *counter, const char **buf)
 	return 0;
 }
 
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 /**
  * set_cycle_count -
  * @counter: Cycle counter object
- * @value: The cycle count value to be set
+ * @count: The cycle count value to be set
  *
- * Get average cycle count for all buckets
- *
+ * Set the cycle count for all buckets.
  */
 int set_cycle_count(struct cycle_counter *counter, u16 count)
 {
-	int rc, id;
+	int rc = 0, id;
 
+	mutex_lock(&counter->lock);
 	for (id = 0; id < BUCKET_COUNT; id++) {
-		rc = counter->store_count(counter->data, &count, id, 2);
+		rc = counter->store_count(counter->data, &count, id, sizeof(count));
 		if (rc < 0)
-			pr_err("failed to clear cycle counter rc=%d\n", rc);
+			break;
+		counter->count[id] = count;
 	}
+	mutex_unlock(&counter->lock);
 
-	return 0;
+	return rc;
 }
-#endif
 
 /**
  * cycle_count_init -

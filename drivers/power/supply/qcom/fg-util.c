@@ -2,6 +2,7 @@
 /*
  * Copyright (c) 2016-2020, The Linux Foundation. All rights reserved.
  * Copyright (c) 2023-2024, Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (C) 2021 XiaoMi, Inc.
  */
 
 #include <linux/of.h>
@@ -404,8 +405,7 @@ void fg_notify_charger(struct fg_dev *fg)
 		}
 	}
 
-#ifndef CONFIG_MACH_XIAOMI_SM8150
-	if (fg->bp.fastchg_curr_ma > 0) {
+	if (fg->version != GEN4_FG && fg->bp.fastchg_curr_ma > 0) {
 		prop.intval = fg->bp.fastchg_curr_ma * 1000;
 		rc = power_supply_set_property(fg->batt_psy,
 				POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX,
@@ -416,8 +416,6 @@ void fg_notify_charger(struct fg_dev *fg)
 			return;
 		}
 	}
-#endif
-
 }
 
 bool batt_psy_initialized(struct fg_dev *fg)
@@ -894,10 +892,8 @@ wait:
 		goto out;
 	}
 out:
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 	if (fg->empty_restart_fg)
 		fg->empty_restart_fg = false;
-#endif
 	fg->fg_restarting = false;
 	return rc;
 }
@@ -947,22 +943,17 @@ int fg_get_msoc(struct fg_dev *fg, int *msoc)
 	 * of the values 1-254 will be scaled to 1-99. DIV_ROUND_UP will not
 	 * be suitable here as it rounds up any value higher than 252 to 100.
 	 */
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 	if ((*msoc >= FULL_SOC_REPORT_THR - 2)
 				&& (*msoc < FULL_SOC_RAW) && fg->report_full) {
 		*msoc = DIV_ROUND_CLOSEST(*msoc * FULL_CAPACITY, FULL_SOC_RAW) + 1;
 		if (*msoc >= FULL_CAPACITY)
 			*msoc = FULL_CAPACITY;
-	} else
-#endif
-	if (*msoc == FULL_SOC_RAW)
+	} else if (*msoc == FULL_SOC_RAW)
 		*msoc = 100;
 	else if (*msoc == 0)
 		*msoc = 0;
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 	else if (*msoc >= FULL_SOC_REPORT_THR - 4 && *msoc <= FULL_SOC_REPORT_THR - 3 && fg->report_full)
 		*msoc = DIV_ROUND_CLOSEST(*msoc * FULL_CAPACITY, FULL_SOC_RAW);
-#endif
 	else
 		*msoc = DIV_ROUND_CLOSEST((*msoc - 1) * (FULL_CAPACITY - 2),
 				FULL_SOC_RAW - 2) + 1;

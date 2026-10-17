@@ -113,20 +113,7 @@ static void power_supply_remove_bat_triggers(struct power_supply *psy)
 
 static void power_supply_update_gen_leds(struct power_supply *psy)
 {
-#ifndef CONFIG_MACH_XIAOMI_SM8150
-	/* xiaomi project don't support this feature, return skip this feature*/
-	union power_supply_propval online;
-
-	if (power_supply_get_property(psy, POWER_SUPPLY_PROP_ONLINE, &online))
-		return;
-
-	dev_dbg(&psy->dev, "%s %d\n", __func__, online.intval);
-
-	if (online.intval)
-		led_trigger_event(psy->online_trig, LED_FULL);
-	else
-		led_trigger_event(psy->online_trig, LED_OFF);
-#endif
+	/* Xiaomi controls the charger LEDs separately. */
 }
 
 static int power_supply_create_gen_triggers(struct power_supply *psy)
