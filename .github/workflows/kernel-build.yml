@@ -1,0 +1,288 @@
+name: Kernel Build (raphael 5.4)
+
+# 用途：
+#   1) 把用户的 75/90Hz 高刷提交 rebase 到上游最新（在 runner 内完成，避免本地下载 1.4GB）
+#   2) 编译验证，并顺带验证 P2(NFC) 使能改动
+# 设计要点见 RECON.md / P2_CANDIDATE.md / CI_SETUP.md
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_mode:
+        description: '源码基线'
+        type: choice
+        options:
+          - 'upstream-latest'   # 上游最新（c50effa 等）：P2 验证基准
+          - 'fork-tip'          # 你的 fork 当前 tip（4807ce0，已含 75/90Hz）
+          - 'rebase'            # 把 75/90Hz 提交 rebase 到上游最新（推荐）
+        default: 'rebase'
+      fork_repo:
+        description: '你的 fork 仓库（rebase 模式从此处取 75/90Hz 提交）'
+        type: string
+        default: 'Shiho-Patch/kernel_xiaomi_raphael-5.4'
+      hotfix_commit:
+        description: '要 rebase 的高刷提交'
+        type: string
+        default: '4807ce0a763368502bff522a4c0cdc28050189c7'
+      upstream_ref:
+        description: '上游基线分支/提交'
+        type: string
+        default: 'zundamon-miui-5.4'
+      nfc_enable:
+        description: '应用 NFC 使能改动 (CONFIG_NFC_QTI_I2C=y)'
+        type: boolean
+        default: true
+      nfc_extra_core:
+        description: '同时开启内核 NFC 子系统（仅当符号被 Kconfig 丢弃时使用）'
+        type: boolean
+        default: false
+      llvm_version:
+        description: 'LLVM/clang 版本（本树 CFI+LTO，需与位码自洽）'
+        type: string
+        default: '12'
+
+concurrency:
+  group: kernel-${{ inputs.source_mode }}-${{ inputs.nfc_enable }}-${{ inputs.nfc_extra_core }}
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: HeliumStudio-Dev/kernel_xiaomi_raphael-5.4
+  ARCH: arm64
+  # 实测自 arch/arm64/configs/vendor/ —— 不是 raphael_defconfig
+  DEFCONFIG: vendor/sm8150-qgki_defconfig
+
+jobs:
+  build:
+    name: ${{ inputs.source_mode }}${{ inputs.nfc_enable && ' +NFC' || '' }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+
+    steps:
+      # ---------------------------------------------------------------- 取源码
+      - name: Checkout (upstream-latest / fork-tip)
+        if: ${{ inputs.source_mode != 'rebase' }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.source_mode == 'fork-tip' && inputs.fork_repo || env.UPSTREAM_REPO }}
+          ref: ${{ inputs.source_mode == 'fork-tip' && 'zundamon-miui-5.4' || inputs.upstream_ref }}
+          path: kernel
+          fetch-depth: 1
+          filter: blob:none
+
+      - name: Checkout (rebase base)
+        if: ${{ inputs.source_mode == 'rebase' }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ inputs.upstream_ref }}
+          path: kernel
+          fetch-depth: 1
+          filter: blob:none
+
+      # rebase 需要 fork 的提交对象：单独 fetch 那一个 commit的完整内容
+      - name: Fetch hotfix commit from fork
+        if: ${{ inputs.source_mode == 'rebase' }}
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          git config user.email "ci@raphael.local"
+          git config user.name  "raphael-ci"
+          git remote add fork "https://github.com/${{ inputs.fork_repo }}.git"
+          echo "--- fetching ${{ inputs.hotfix_commit }} and its history ---"
+          # 需要父提交以正确计算 diff
+          git fetch --no-tags --filter=blob:none fork "${{ inputs.hotfix_commit }}"
+          echo "fetched: $(git rev-parse FETCH_HEAD)"
+          echo "--- commit subject ---"
+          git log -1 --format='%H%n%an <%ae>%n%s' FETCH_HEAD
+
+      - name: Apply hotfix onto upstream (cherry-pick)
+        if: ${{ inputs.source_mode == 'rebase' }}
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          BASE=$(git rev-parse HEAD)
+          echo "base(upstream): $BASE"
+          HOTFIX=$(git rev-parse FETCH_HEAD)
+          echo "hotfix: $HOTFIX"
+
+          # 先确认三个目标文件在基线上的样子（诊断用）
+          echo "=== 目标文件是否存在于基线 ==="
+          for f in arch/arm64/boot/dts/qcom/display/dsi-panel-ss-fhd-ea8076-cmd.dtsi \
+                   arch/arm64/boot/dts/qcom/display/dsi-panel-ss-fhd-ea8076-global-cmd.dtsi \
+                   arch/arm64/boot/dts/qcom/sm8150-sde-display.dtsi; do
+            if git cat-file -e "$BASE:$f" 2>/dev/null; then echo "  OK   $f"; else echo "  MISS $f"; fi
+          done
+
+          echo "=== 尝试 cherry-pick ==="
+          if git cherry-pick -x "$HOTFIX"; then
+            echo "::notice::cherry-pick 干净成功，无冲突"
+          else
+            echo "::error title=Rebase conflict::cherry-pick 产生冲突，需人工介入。"
+            echo "--- 冲突文件 ---"
+            git status --porcelain || true
+            echo "--- 冲突详情 ---"
+            git diff --name-only --diff-filter=U || true
+            git diff || true
+            exit 1
+          fi
+
+          echo "=== rebase 后提交 ==="
+          git log --oneline -3
+          echo "=== 改动统计 ==="
+          git --no-pager diff --stat "$BASE" HEAD
+
+      - name: Show source identity
+        working-directory: kernel
+        run: |
+          echo "HEAD: $(git rev-parse HEAD)"
+          echo "SUBLEVEL: $(grep -m1 '^SUBLEVEL' Makefile)"
+          echo "--- ea8076 timing 数量（应为 3：60/75/90）---"
+          grep -c 'timing@' arch/arm64/boot/dts/qcom/display/dsi-panel-ss-fhd-ea8076-cmd.dtsi || true
+
+      # ------------------------------------------------------------ 环境准备
+      - name: Install host build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libssl-dev libelf-dev \
+            zip unzip rsync cpio kmod device-tree-compiler \
+            python3 python-is-python3 zstd lz4
+          df -h /
+
+      - name: Set up LLVM ${{ inputs.llvm_version }}
+        uses: ZhongRuoyu/setup-llvm@v0
+        with:
+          llvm-version: ${{ inputs.llvm_version }}
+
+      - name: Verify toolchain
+        run: |
+          clang --version | head -n2
+          ld.lld --version
+          llvm-ar --version | head -n1
+
+      # ------------------------------------------------------------ NFC 改动
+      - name: Apply P2 NFC candidate change
+        if: ${{ inputs.nfc_enable }}
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          CFG="arch/arm64/configs/${DEFCONFIG}"
+          test -f "$CFG" || { echo "::error::defconfig not found: $CFG"; exit 1; }
+
+          ANCHOR_CNT=$(grep -c '^CONFIG_I2C_CHARDEV=y$' "$CFG" || true)
+          echo "anchor occurrences: $ANCHOR_CNT"
+
+          sed -i '/^CONFIG_NFC_QTI_I2C=/d' "$CFG"
+          if [ "${{ inputs.nfc_extra_core }}" = "true" ]; then
+            sed -i -e '/^CONFIG_NFC_NCI=/d' -e '/^CONFIG_NFC=/d' "$CFG"
+            printf 'CONFIG_NFC=%s\nCONFIG_NFC_NCI=%s\n' y y >> "$CFG"
+          fi
+          if [ "$ANCHOR_CNT" -eq 1 ]; then
+            sed -i '/^CONFIG_I2C_CHARDEV=y$/a CONFIG_NFC_QTI_I2C=y' "$CFG"
+          else
+            echo "::warning::锚点不唯一，追加到末尾"
+            echo 'CONFIG_NFC_QTI_I2C=y' >> "$CFG"
+          fi
+
+          echo "=== diff ==="
+          git --no-pager diff -- "$CFG"
+
+      # ------------------------------------------------------------ 配置 + 构建
+      - name: Generate config
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          make -C "$PWD" O=out ARCH=${ARCH} LLVM=1 LLVM_IAS=1 ${DEFCONFIG}
+
+      - name: Verify NFC symbol not dropped
+        if: ${{ inputs.nfc_enable }}
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          echo "--- NFC entries in .config ---"
+          grep -nE 'NFC' out/.config || true
+          if ! grep -qx 'CONFIG_NFC_QTI_I2C=y' out/.config; then
+            echo "::error title=NFC symbol dropped::CONFIG_NFC_QTI_I2C=y 未出现在 out/.config"
+            echo "::error::补救：重跑并勾选 nfc_extra_core"
+            grep -E '^CONFIG_I2C' out/.config || true
+            exit 1
+          fi
+          echo "OK: NFC 符号保留"
+
+      - name: Build kernel
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          make -C "$PWD" O=out ARCH=${ARCH} LLVM=1 LLVM_IAS=1 -j"$(nproc)"
+
+      - name: Collect diagnostics on failure
+        if: failure()
+        working-directory: kernel
+        run: |
+          echo "=== 关键错误行（keep-going 重跑）==="
+          make -C "$PWD" O=out ARCH=${ARCH} LLVM=1 LLVM_IAS=1 -j"$(nproc)" -k 2>&1 \
+            | tail -n 600 | grep -iE 'error|fatal|undefined|warning: .*panel' | head -n 200 || echo "(无错误行)"
+          echo "=== 关键 config ==="
+          grep -E '^CONFIG_(LTO|CFI|LD_IS|NFC|I2C)' out/.config || true
+
+      - name: Verify nfc_i2c.o built
+        if: success() && inputs.nfc_enable
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          OBJ=$(find out -name 'nfc_i2c.o' -print -quit)
+          [ -n "$OBJ" ] || { echo "::error::nfc_i2c.o 未产出"; exit 1; }
+          echo "OK: $OBJ"
+          llvm-nm "$OBJ" | grep -iE 'nfc_i2c_dev_probe' || true
+
+      - name: Gather artifacts
+        if: success()
+        working-directory: kernel
+        run: |
+          ls -lh out/arch/arm64/boot/Image* || true
+          ls -lh out/arch/arm64/boot/dtbo.img 2>/dev/null || true
+          find out -name '*.dtb' | head -n 30 || true
+          echo "=== sha256 ==="
+          sha256sum out/arch/arm64/boot/Image 2>/dev/null || true
+          echo "=== 生成的 dtbo 中是否含 ea8076 三档 timing ==="
+          grep -c 'timing@' arch/arm64/boot/dts/qcom/display/dsi-panel-ss-fhd-ea8076-cmd.dtsi || true
+
+      - name: Upload artifacts
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: raphael-${{ inputs.source_mode }}-${{ github.run_number }}
+          path: |
+            kernel/out/arch/arm64/boot/Image
+            kernel/out/arch/arm64/boot/Image.gz
+            kernel/out/arch/arm64/boot/dtbo.img
+            kernel/out/.config
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload rebase patch
+        if: always() && inputs.source_mode == 'rebase'
+        working-directory: kernel
+        run: |
+          git format-patch -1 HEAD --stdout > /tmp/rebased-hotfix.patch 2>/dev/null \
+            || git format-patch -1 HEAD | xargs -I{} cp {} /tmp/rebased-hotfix.patch || true
+          ls -l /tmp/rebased-hotfix.patch 2>/dev/null || true
+
+      - name: Upload patch
+        if: always() && inputs.source_mode == 'rebase'
+        uses: actions/upload-artifact@v4
+        with:
+          name: rebased-patch-${{ github.run_number }}
+          path: /tmp/rebased-hotfix.patch
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload config
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: config-${{ github.run_number }}
+          path: kernel/out/.config
+          if-no-files-found: warn
+          retention-days: 7
