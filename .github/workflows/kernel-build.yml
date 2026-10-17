@@ -149,16 +149,60 @@ jobs:
             python3 python-is-python3 zstd lz4
           df -h /
 
-      - name: Set up LLVM ${{ inputs.llvm_version }}
-        uses: ZhongRuoyu/setup-llvm@v0
-        with:
-          llvm-version: ${{ inputs.llvm_version }}
+      # 用 apt 安装 LLVM/LLD。不用第三方 setup action：
+      # 上一轮 run 中 ZhongRuoyu/setup-llvm 被 skipped，导致 clang/ld.lld 完全缺失，
+      # 进而 Makefile 的 kernelrelease 校验失败、.config 无法生成。
+      - name: Install LLVM/LLD ${{ inputs.llvm_version }}
+        run: |
+          set -euo pipefail
+          V="${{ inputs.llvm_version }}"
+
+          # ubuntu-22.04 预装 llvm-12..15；直接按版本号装
+          if apt-cache show "clang-$V" >/dev/null 2>&1; then
+            echo "从默认源安装 clang-$V / lld-$V"
+            sudo apt-get install -y --no-install-recommends \
+              "clang-$V" "lld-$V" "llvm-$V" libclang-common-"$V"-dev
+          else
+            echo "默认源无 clang-$V，添加 apt.llvm.org"
+            wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
+              | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
+            echo "deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-$V main" \
+              | sudo tee /etc/apt/sources.list.d/llvm-$V.list
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends \
+              "clang-$V" "lld-$V" "llvm-$V" libclang-common-"$V"-dev
+          fi
+
+          # 建立无版本号的符号链接（kbuild 调用裸 clang / ld.lld）
+          LLVM_BIN="/usr/lib/llvm-$V/bin"
+          test -d "$LLVM_BIN" || { echo "::error::$LLVM_BIN 不存在"; ls /usr/lib | grep -i llvm || true; exit 1; }
+
+          sudo mkdir -p /usr/local/bin
+          for t in clang clang++ ld.lld llvm-ar llvm-nm llvm-objcopy llvm-objdump \
+                   llvm-readelf llvm-size llvm-strip llvm-dwarfdump; do
+            if [ -e "$LLVM_BIN/$t" ]; then
+              sudo ln -sf "$LLVM_BIN/$t" "/usr/local/bin/$t"
+            else
+              echo "::warning::缺少 $t"
+            fi
+          done
+          hash -r
 
       - name: Verify toolchain
         run: |
+          set -euo pipefail
+          echo "--- which ---"
+          for t in clang ld.lld llvm-ar llvm-nm; do
+            printf '%-10s -> %s\n' "$t" "$(command -v $t || echo MISSING)"
+          done
+          echo "--- versions ---"
           clang --version | head -n2
           ld.lld --version
           llvm-ar --version | head -n1
+          # 硬性断言：缺任何一个立即失败，避免再次白跑一小时
+          command -v clang   >/dev/null || { echo "::error::clang 缺失"; exit 1; }
+          command -v ld.lld  >/dev/null || { echo "::error::ld.lld 缺失"; exit 1; }
+          echo "OK: LLVM 工具链就位"
 
       # ------------------------------------------------------------ NFC 改动
       - name: Apply P2 NFC candidate change
@@ -193,7 +237,19 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p out
-          make -C "$PWD" O=out ARCH=${ARCH} LLVM=1 LLVM_IAS=1 ${DEFCONFIG}
+          echo "--- 工具链自检（kbuild 会用 \$(CC) 探测版本）---"
+          clang --version | head -n1
+          echo "--- 生成 defconfig ---"
+          if ! make -C "$PWD" O=out ARCH=${ARCH} LLVM=1 LLVM_IAS=1 ${DEFCONFIG}; then
+            echo "::error title=defconfig failed::配置生成失败"
+            echo "### 诊断"
+            echo "- defconfig 文件: $(ls -l arch/arm64/configs/${DEFCONFIG} 2>&1)"
+            echo "- clang: $(command -v clang || echo MISSING)"
+            echo "- ld.lld: $(command -v ld.lld || echo MISSING)"
+            echo "- 源码是否干净: $(git status --porcelain | wc -l) 个改动"
+            exit 1
+          fi
+          echo "--- .config 行数: $(wc -l < out/.config) ---"
 
       - name: Verify NFC symbol not dropped
         if: ${{ inputs.nfc_enable }}
